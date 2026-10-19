@@ -4,6 +4,7 @@ import numpy as np
 from scipy.stats import poisson
 import io
 import requests
+import time
 from concurrent.futures import ThreadPoolExecutor
 from difflib import get_close_matches
 
@@ -584,12 +585,24 @@ def build_cup_bundle(cup_name, season_key, form_weight_pct, k_factor, api_keys):
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 
+def get_with_retry(url, params, attempts=3):
+    """GET avec nouvelle tentative quand l'API limite la fréquence des appels (429 de fréquence)."""
+    res = None
+    for attempt in range(attempts):
+        res = requests.get(url, params=params, timeout=12)
+        if res.status_code == 429 and "FREQ" in res.text.upper() and attempt < attempts - 1:
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        break
+    return res
+
+
 def odds_api_get(path, params, api_keys):
     """GET sur The Odds API en essayant les clés dans l'ordre (401 ou 429 : clé suivante)."""
     status = None
     for pos, key in enumerate(api_keys):
         try:
-            res = requests.get(f"{ODDS_API_BASE}{path}", params={**params, "apiKey": key.strip()}, timeout=12)
+            res = get_with_retry(f"{ODDS_API_BASE}{path}", {**params, "apiKey": key.strip()})
         except Exception as e:
             status = f"🟠 Erreur réseau API ({str(e)[:40]})"
             continue
@@ -671,7 +684,7 @@ def fetch_events_by_sport(sport_keys, api_keys):
     def one(key):
         data, _ = odds_api_get(f"/sports/{key}/events", {}, api_keys)
         return key, [e.get("commence_time", "") for e in (data or [])]
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         return dict(pool.map(one, sport_keys))
 
 
@@ -686,7 +699,7 @@ def fetch_many_sport_odds(items, api_keys):
             api_keys
         )
         return (consensus_rows(data, label) if data else []), status
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         results = list(pool.map(one, items))
     rows = [row for res in results for row in res[0]]
     statuses = [res[1] for res in results if res[1]]
