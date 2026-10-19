@@ -4,6 +4,7 @@ import numpy as np
 from scipy.stats import poisson
 import io
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from difflib import get_close_matches
 
 st.set_page_config(page_title="Logiciel de Prédiction Pro v4 (Live Odds API)", layout="wide")
@@ -664,6 +665,34 @@ def fetch_sport_odds(sport_key, sport_label, api_keys):
     return (consensus_rows(data, sport_label) if data else []), status
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_events_by_sport(sport_keys, api_keys):
+    """Heures de coup d'envoi des matchs à venir par compétition (appel gratuit, sans quota)."""
+    def one(key):
+        data, _ = odds_api_get(f"/sports/{key}/events", {}, api_keys)
+        return key, [e.get("commence_time", "") for e in (data or [])]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return dict(pool.map(one, sport_keys))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_many_sport_odds(items, api_keys):
+    """items : tuple de (clé, libellé). Retourne les lignes de consensus et les statuts API."""
+    def one(item):
+        key, label = item
+        data, status = odds_api_get(
+            f"/sports/{key}/odds/",
+            {"regions": "eu", "markets": "h2h", "oddsFormat": "decimal"},
+            api_keys
+        )
+        return (consensus_rows(data, label) if data else []), status
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(one, items))
+    rows = [row for res in results for row in res[0]]
+    statuses = [res[1] for res in results if res[1]]
+    return rows, statuses
+
+
 st.title("⚽ Logiciel de Prédiction Pro v4 : Championnats + Coupes d'Europe + Combinés + Bankroll")
 
 secret_keys = read_api_keys_from_secrets()
@@ -887,56 +916,76 @@ else:
             st.dataframe(df_history[['Date', 'Season', 'HomeTeam', 'FTHG', 'FTAG', 'AwayTeam', 'FTR']].iloc[::-1], use_container_width=True)
 
 
-    # --- ONGLET 5 : AUTRES SPORTS (COTES COMPARÉES ENTRE BOOKMAKERS) ---
+    # --- ONGLET 5 : AUTRES SPORTS (TOUS LES MATCHS DU CRÉNEAU, COTES COMPARÉES) ---
     with tab_sports:
-        st.subheader("🌍 Autres sports : cotes comparées entre bookmakers")
+        st.subheader("🌍 Autres sports : tous les matchs du créneau, cotes comparées")
         st.caption(
             "Pour ces sports, il n'y a pas d'historique de résultats : les probabilités sont le consensus des bookmakers "
             "(marge retirée). « Value » signale une meilleure cote supérieure de plus de 2 % à la cote juste du consensus, "
-            "avec au moins 3 bookmakers. Chaque compétition analysée coûte 1 requête API."
+            "avec au moins 3 bookmakers. Les compétitions sans match dans le créneau ne sont pas interrogées."
         )
         all_sports, sports_status = list_active_sports(api_keys)
         if not all_sports:
             st.warning(sports_status)
         else:
+            horizon_h = st.slider("Créneau : matchs dans les prochaines (heures)", 6, 168, 24, 6, key="sports_horizon")
             groups = sorted({s["group"] for s in all_sports})
-            chosen_groups = st.multiselect("Sports", groups, default=[])
-            options = {f"{s['group']} · {s['title']}": s for s in all_sports if s["group"] in chosen_groups}
-            chosen_names = st.multiselect("Compétitions", list(options.keys()), default=list(options.keys())[:8])
-            if len(chosen_names) > 15:
-                st.warning("Maximum 15 compétitions à la fois pour protéger votre quota : les 15 premières sont analysées.")
-                chosen_names = chosen_names[:15]
-            horizon_h = st.slider("Matchs dans les prochaines (heures)", 12, 336, 72, 12, key="sports_horizon")
-            st.caption(f"{len(all_sports)} compétitions actives disponibles. Sélection : {len(chosen_names)} (= {len(chosen_names)} requête(s)).")
-            if st.button("Analyser les compétitions choisies", disabled=not chosen_names):
-                collected, last_status = [], None
-                with st.spinner("Récupération des cotes..."):
-                    for label in chosen_names:
-                        sport = options[label]
-                        rows, last_status = fetch_sport_odds(sport["key"], label, api_keys)
-                        collected.extend(rows)
-                st.session_state["sports_rows"] = collected
-                st.session_state["sports_status"] = last_status
-            if "sports_rows" in st.session_state:
-                if st.session_state.get("sports_status"):
-                    st.info(st.session_state["sports_status"])
-                sports_df = pd.DataFrame(st.session_state["sports_rows"])
+            chosen_groups = st.multiselect("Sports", groups, default=groups)
+            max_calls = st.number_input(
+                "Plafond de requêtes API par chargement", min_value=1, max_value=70, value=25, step=5,
+                help="Une requête par compétition ayant des matchs dans le créneau. Protège votre quota mensuel."
+            )
+            pool_sports = [s for s in all_sports if s["group"] in chosen_groups]
+            events_by_sport = fetch_events_by_sport(tuple(s["key"] for s in pool_sports), api_keys)
+            now_utc = pd.Timestamp.now(tz="UTC")
+            window_start = now_utc - pd.Timedelta(hours=2)
+            window_end = now_utc + pd.Timedelta(hours=horizon_h)
+
+            def count_in_window(times):
+                stamps = pd.to_datetime(pd.Series(times, dtype="object"), errors="coerce", utc=True)
+                return int(((stamps >= window_start) & (stamps <= window_end)).sum())
+
+            active = [(s, count_in_window(events_by_sport.get(s["key"], []))) for s in pool_sports]
+            active = sorted([(s, n) for s, n in active if n > 0], key=lambda x: -x[1])
+            if not active:
+                st.info("Aucun match dans ce créneau pour les sports choisis. Élargissez le nombre d'heures.")
+            else:
+                to_query = active[:int(max_calls)]
+                if len(active) > len(to_query):
+                    st.warning(
+                        f"{len(active)} compétitions ont des matchs dans le créneau : les {len(to_query)} qui en ont le plus "
+                        "sont analysées (plafond de requêtes). Réduisez le créneau ou les sports, ou relevez le plafond."
+                    )
+                st.caption(
+                    f"{sum(n for _, n in active)} match(s) annoncé(s) sur {len(active)} compétition(s). "
+                    f"Requêtes API utilisées : {len(to_query)} (mises en cache 5 minutes)."
+                )
+                items = tuple((s["key"], f"{s['group']} · {s['title']}") for s, _ in to_query)
+                with st.spinner("Récupération des cotes de tous les matchs du créneau..."):
+                    sports_rows, sports_statuses = fetch_many_sport_odds(items, api_keys)
+                good = [m for m in sports_statuses if m.startswith("🟢")]
+                if good:
+                    st.info(good[-1])
+                for message in sorted({m for m in sports_statuses if m.startswith(("🔴", "🟠"))}):
+                    st.warning(message)
+                sports_df = pd.DataFrame(sports_rows)
                 if sports_df.empty:
                     st.info("Aucun match avec cotes pour cette sélection.")
                 else:
                     kick = pd.to_datetime(sports_df["_kickoff"], errors="coerce", utc=True)
-                    now_utc = pd.Timestamp.now(tz="UTC")
-                    in_window = (kick >= now_utc - pd.Timedelta(hours=2)) & (kick <= now_utc + pd.Timedelta(hours=horizon_h))
-                    view_df = sports_df[in_window].copy()
-                    view_df["_k"] = kick[in_window]
+                    view_df = sports_df[(kick >= window_start) & (kick <= window_end)].copy()
+                    view_df["_k"] = kick[view_df.index]
                     view_df = view_df.sort_values("_k")
                     view_df["Coup d'envoi (Paris)"] = view_df["_k"].dt.tz_convert("Europe/Paris").dt.strftime("%a %d/%m %H:%M")
                     only_value_sports = st.checkbox("Afficher seulement les Value", key="sports_only_value")
                     if only_value_sports:
                         view_df = view_df[view_df["Value"] == "✅ VALUE"]
-                    st.caption(f"{len(view_df)} match(s) dans la fenêtre choisie.")
+                    n_value_sports = int((view_df["Value"] == "✅ VALUE").sum()) if not view_df.empty else 0
+                    c1, c2 = st.columns(2)
+                    c1.metric("Matchs dans le créneau", len(view_df))
+                    c2.metric("Value détectées", n_value_sports)
                     if view_df.empty:
-                        st.info("Aucun match dans cette fenêtre. Élargissez le nombre d'heures.")
+                        st.info("Aucun match à afficher avec ce filtre.")
                     else:
                         st.dataframe(
                             view_df[[
