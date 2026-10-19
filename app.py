@@ -647,12 +647,52 @@ else:
             if msg.startswith("🔴") or msg.startswith("🟠"):
                 st.warning(f"{n} : {msg}")
 
-    tab_scanner, tab_combo, tab_sim, tab_hist = st.tabs([
+    tab_next, tab_scanner, tab_combo, tab_sim, tab_hist = st.tabs([
+        "⏱️ Prochaines 24h",
         "⚡ Scanner Matchs & Cotes en Direct",
         "🎟️ Générateur de Combinés (Duo/Trio) & Spécial '2'",
         "🔍 Simulateur Match par Match",
         "📜 Base Historique & Classement Elo"
     ])
+
+    # --- ONGLET 0 : PROCHAINS MATCHS (TOUTES COMPÉTITIONS, FENÊTRE EN HEURES) ---
+    with tab_next:
+        window_h = st.slider("Fenêtre à venir (heures)", 6, 72, 24, 6)
+        if df_preds.empty:
+            st.warning("Aucun match disponible pour les compétitions choisies.")
+        else:
+            date_text = df_preds["Date"].astype(str).str.strip()
+            kickoff = pd.to_datetime(date_text, format="%Y-%m-%d %H:%M", errors="coerce", utc=True)
+            kickoff = kickoff.fillna(pd.to_datetime(date_text, format="%d/%m/%Y %H:%M", errors="coerce", utc=True))
+            kickoff = kickoff.fillna(pd.to_datetime(date_text, format="%Y-%m-%d", errors="coerce", utc=True))
+            now_utc = pd.Timestamp.now(tz="UTC")
+            in_window = (kickoff >= now_utc - pd.Timedelta(hours=2)) & (kickoff <= now_utc + pd.Timedelta(hours=window_h))
+            soon = df_preds[in_window].copy()
+            soon["_kickoff"] = kickoff[in_window]
+            soon = soon.sort_values("_kickoff")
+            soon["Coup d'envoi (Paris)"] = soon["_kickoff"].dt.tz_convert("Europe/Paris").dt.strftime("%a %d/%m %H:%M")
+            st.subheader(f"⏱️ Matchs des {window_h} prochaines heures — toutes compétitions")
+            st.caption(
+                f"{len(soon)} match(s) sur {soon['Championnat'].nunique() if not soon.empty else 0} compétition(s). "
+                "Heures affichées à l'heure de Paris, matchs commencés depuis moins de 2 h inclus."
+            )
+            if soon.empty:
+                st.info("Aucun match dans cette fenêtre. Essayez 48 ou 72 heures.")
+            else:
+                n_value = int(soon["Value Bet Live"].str.contains("VALUE").sum())
+                m1, m2 = st.columns(2)
+                m1.metric("Matchs à venir", len(soon))
+                m2.metric("Value Bets détectés", n_value)
+                next_cols = [
+                    "Coup d'envoi (Paris)", "Championnat", "Domicile", "Extérieur",
+                    "1 (%)", "N (%)", "2 (%)", "Cote 1", "Cote N", "Cote 2",
+                    "Pronostic Conseillé", "Value Bet Live"
+                ]
+                st.dataframe(
+                    soon[next_cols].style.background_gradient(subset=["1 (%)", "2 (%)"], cmap="YlGn"),
+                    use_container_width=True,
+                    hide_index=True
+                )
 
     # --- ONGLET 1 : SCANNER TEMPS RÉEL (CHAMPIONNATS + COUPES) ---
     with tab_scanner:
