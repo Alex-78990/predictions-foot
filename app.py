@@ -652,7 +652,7 @@ def consensus_rows(events, sport_label):
         favourite = max(consensus, key=consensus.get)
         value_pick = max(consensus, key=lambda n: consensus[n] * best[n])
         value_pct = (consensus[value_pick] * best[value_pick] - 1) * 100
-        is_value = value_pct > 2.0 and n_books >= 3
+        is_value = value_pct > 5.0 and n_books >= 5
         rows.append({
             "Sport": sport_label,
             "_kickoff": ev.get("commence_time", ""),
@@ -934,8 +934,8 @@ else:
         st.subheader("🌍 Autres sports : tous les matchs du créneau, cotes comparées")
         st.caption(
             "Pour ces sports, il n'y a pas d'historique de résultats : les probabilités sont le consensus des bookmakers "
-            "(marge retirée). « Value » signale une meilleure cote supérieure de plus de 2 % à la cote juste du consensus, "
-            "avec au moins 3 bookmakers. Les compétitions sans match dans le créneau ne sont pas interrogées."
+            "(marge retirée). « Value » signale une meilleure cote supérieure de plus de 5 % à la cote juste du consensus, "
+            "avec au moins 5 bookmakers. Les compétitions sans match dans le créneau ne sont pas interrogées."
         )
         all_sports, sports_status = list_active_sports(api_keys)
         if not all_sports:
