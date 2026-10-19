@@ -385,51 +385,231 @@ def build_predictions(df_upcoming, stats, elo_ratings, avg_h, avg_a):
     return predictions_list
 
 
+CUPS = {
+    "Ligue des Champions": "soccer_uefa_champs_league",
+    "Europa League": "soccer_uefa_europa_league",
+    "Conference League": "soccer_uefa_europa_conference_league"
+}
+
+# Écart de niveau estimé entre championnats (points Elo ajoutés), pour comparer des clubs de pays différents.
+LEAGUE_ELO_OFFSET = {
+    "Premier League (Angleterre)": 60,
+    "La Liga (Espagne)": 40,
+    "Bundesliga (Allemagne)": 20,
+    "Serie A (Italie)": 15,
+    "Ligue 1 (France)": 0
+}
+
+ALL_COMPETITIONS = list(LEAGUES.keys()) + list(CUPS.keys())
+
+
+def read_api_keys_from_secrets():
+    """Clés enregistrées côté serveur : ODDS_API_KEY (une clé) et ODDS_API_KEYS (liste de clés)."""
+    try:
+        single = st.secrets.get("ODDS_API_KEY", "")
+        multi = st.secrets.get("ODDS_API_KEYS", [])
+    except Exception:
+        return []
+    if isinstance(multi, str):
+        multi = multi.replace(",", "\n").splitlines()
+    keys = []
+    for k in [single, *list(multi)]:
+        k = str(k).strip()
+        if len(k) > 10 and k not in keys:
+            keys.append(k)
+    return keys
+
+
+def match_cup_team(name, valid_teams):
+    """Rapprochement strict des noms d'équipes pour les coupes (évite les faux positifs sur les clubs étrangers)."""
+    clean = TEAM_ALIASES.get(name, name)
+    if clean in valid_teams:
+        return clean
+    lowered = {t.lower(): t for t in valid_teams}
+    if clean.lower() in lowered:
+        return lowered[clean.lower()]
+    contained = [t for t in valid_teams if len(t) >= 6 and t.lower() in clean.lower()]
+    if len(contained) == 1:
+        return contained[0]
+    close = get_close_matches(clean, valid_teams, n=1, cutoff=0.8)
+    return close[0] if close else None
+
+
+def fetch_league_with_rotation(info, api_keys, valid_teams, df_history):
+    """Essaie les clés dans l'ordre : passe à la suivante si la clé est invalide, expirée ou épuisée."""
+    keys = list(api_keys) if api_keys else [""]
+    result = (pd.DataFrame(), None)
+    for pos, key in enumerate(keys):
+        df_up, status = fetch_upcoming_matches(info["code"], info["odds_api"], key, valid_teams, df_history)
+        if pos > 0 and status and status.startswith("🟢"):
+            status += f" | ↪ clé n°{pos + 1} utilisée (les précédentes sont expirées ou épuisées)"
+        result = (df_up, status)
+        if not status or not status.startswith(("🔴", "🟠")):
+            break
+    return result
+
+
+def parse_cup_events(events, valid_teams):
+    rows, skipped = [], 0
+    for item in events:
+        raw_h, raw_a = item.get('home_team', ''), item.get('away_team', '')
+        h, a = match_cup_team(raw_h, valid_teams), match_cup_team(raw_a, valid_teams)
+        if not h or not a or h == a:
+            skipped += 1
+            continue
+        odds_1, odds_n, odds_2 = [], [], []
+        for bm in item.get('bookmakers', []):
+            for market in bm.get('markets', []):
+                if market.get('key') != 'h2h':
+                    continue
+                for out in market.get('outcomes', []):
+                    if out['name'] == raw_h:
+                        odds_1.append(float(out['price']))
+                    elif out['name'] == raw_a:
+                        odds_2.append(float(out['price']))
+                    else:
+                        odds_n.append(float(out['price']))
+        commence = item.get('commence_time', '')
+        rows.append({
+            "Date": commence[:10] if commence else "À venir",
+            "Heure": commence[11:16] if len(commence) >= 16 else "",
+            "HomeTeam": h,
+            "AwayTeam": a,
+            "Odd_1": round(max(odds_1), 2) if odds_1 else np.nan,
+            "Odd_N": round(max(odds_n), 2) if odds_n else np.nan,
+            "Odd_2": round(max(odds_2), 2) if odds_2 else np.nan,
+            "Bookmakers": len(item.get('bookmakers', [])),
+            "Source": "⚡ The Odds API (Temps Réel)"
+        })
+    return rows, skipped
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def build_league_bundle(league_name, season_key, form_weight_pct, k_factor, odds_api_key):
-    """Charge l'historique, calcule le modèle et les pronostics d'un championnat."""
+def fetch_cup_matches(sport_key, api_keys, valid_teams):
+    """Matchs de coupes d'Europe via The Odds API, avec bascule sur les clés suivantes."""
+    status, skipped = None, 0
+    for pos, key in enumerate(api_keys):
+        url = (
+            f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
+            f"?apiKey={key.strip()}&regions=eu&markets=h2h&oddsFormat=decimal"
+        )
+        try:
+            res = requests.get(url, timeout=10)
+        except Exception as e:
+            status = f"🟠 Coupes : erreur réseau API ({str(e)[:40]})"
+            continue
+        rem = res.headers.get("x-requests-remaining", "?")
+        if res.status_code == 200:
+            rows, skipped = parse_cup_events(res.json(), valid_teams)
+            status = f"🟢 Coupes d'Europe connectées en direct | clé n°{pos + 1} | requêtes restantes : {rem}"
+            return pd.DataFrame(rows), status, skipped
+        if res.status_code in (401, 429):
+            status = f"🔴 Coupes : clé n°{pos + 1} invalide ou quota atteint (erreur {res.status_code})"
+            continue
+        status = f"🟠 Coupes : compétition indisponible (erreur {res.status_code})"
+        break
+    if not api_keys:
+        status = "🟠 Coupes d'Europe : une clé The Odds API est nécessaire."
+    return pd.DataFrame(), status, skipped
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_league_model(league_name, season_key, form_weight_pct, k_factor):
+    """Historique, Elo et forces d'attaque/défense d'un championnat (sans appel API)."""
     info = LEAGUES[league_name]
     df_history = load_historical_data(info["code"], SEASONS[season_key])
     if df_history.empty:
         return None
     elo_ratings = calculate_elo_ratings(df_history, k_factor=k_factor)
     stats, avg_h, avg_a = calculate_weighted_strengths(df_history, form_weight=form_weight_pct/100.0, n_recent=5)
-    valid_teams = sorted(df_history['HomeTeam'].unique())
-    df_upcoming, api_status = fetch_upcoming_matches(
-        info["code"], info["odds_api"], odds_api_key, valid_teams, df_history
-    )
-    df_preds = pd.DataFrame(build_predictions(df_upcoming, stats, elo_ratings, avg_h, avg_a))
-    if not df_preds.empty:
-        df_preds.insert(0, "Championnat", league_name)
-    source = df_upcoming['Source'].iloc[0] if not df_upcoming.empty else "Aucune source"
     return {
         "df_history": df_history, "elo": elo_ratings, "stats": stats,
-        "avg_h": avg_h, "avg_a": avg_a, "valid_teams": valid_teams,
-        "df_preds": df_preds, "api_status": api_status, "source": source
+        "avg_h": avg_h, "avg_a": avg_a, "valid_teams": sorted(df_history['HomeTeam'].unique())
     }
 
 
-st.title("⚽ Logiciel de Prédiction Pro v4 : Live Odds API + Combinés + Bankroll")
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_european_model(season_key, form_weight_pct, k_factor):
+    """Modèle commun aux 5 championnats pour comparer les clubs en coupe d'Europe."""
+    stats_frames, elo, avg_h_list, avg_a_list = [], {}, [], []
+    for name in LEAGUES:
+        model = build_league_model(name, season_key, form_weight_pct, k_factor)
+        if model is None:
+            continue
+        stats_frames.append(model["stats"])
+        for team, value in model["elo"].items():
+            elo[team] = value + LEAGUE_ELO_OFFSET[name]
+        avg_h_list.append(model["avg_h"])
+        avg_a_list.append(model["avg_a"])
+    if not stats_frames:
+        return None
+    stats = pd.concat(stats_frames)
+    stats = stats[~stats.index.duplicated(keep="last")]
+    return {
+        "stats": stats, "elo": elo, "teams": sorted(stats.index),
+        "avg_h": float(np.mean(avg_h_list)), "avg_a": float(np.mean(avg_a_list))
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def build_league_bundle(league_name, season_key, form_weight_pct, k_factor, api_keys):
+    """Modèle + pronostics d'un championnat."""
+    model = build_league_model(league_name, season_key, form_weight_pct, k_factor)
+    if model is None:
+        return None
+    df_upcoming, api_status = fetch_league_with_rotation(
+        LEAGUES[league_name], api_keys, model["valid_teams"], model["df_history"]
+    )
+    df_preds = pd.DataFrame(build_predictions(df_upcoming, model["stats"], model["elo"], model["avg_h"], model["avg_a"]))
+    if not df_preds.empty:
+        df_preds.insert(0, "Championnat", league_name)
+    source = df_upcoming['Source'].iloc[0] if not df_upcoming.empty else "Aucune source"
+    return {**model, "df_preds": df_preds, "api_status": api_status, "source": source, "skipped": 0}
+
+
+def build_cup_bundle(cup_name, season_key, form_weight_pct, k_factor, api_keys):
+    """Pronostics d'une coupe d'Europe (clubs des 5 grands championnats uniquement)."""
+    model = build_european_model(season_key, form_weight_pct, k_factor)
+    if model is None:
+        return None
+    df_cup, status, skipped = fetch_cup_matches(CUPS[cup_name], api_keys, model["teams"])
+    df_preds = pd.DataFrame(build_predictions(df_cup, model["stats"], model["elo"], model["avg_h"], model["avg_a"]))
+    if not df_preds.empty:
+        df_preds.insert(0, "Championnat", cup_name)
+    source = "⚡ The Odds API (Temps Réel)" if not df_cup.empty else "Aucun match"
+    return {"df_preds": df_preds, "api_status": status, "source": source, "skipped": skipped}
+
+
+st.title("⚽ Logiciel de Prédiction Pro v4 : Championnats + Coupes d'Europe + Combinés + Bankroll")
+
+secret_keys = read_api_keys_from_secrets()
 
 with st.sidebar:
     st.header("🔑 Connexion API Temps Réel")
-    odds_api_key = st.text_input(
-        "Clé The-Odds-API (Direct)",
-        value=DEFAULT_API_KEY,
-        type="password",
-        help="Obtenez une clé gratuite sur the-odds-api.com (500 appels/mois) pour récupérer les matchs et les meilleures cotes en direct."
-    )
+    if secret_keys:
+        st.caption(f"🔒 {len(secret_keys)} clé(s) enregistrée(s) côté serveur (non affichée(s)).")
+    st.caption("Clés de secours : utilisées dans l'ordre quand la précédente est invalide, expirée ou épuisée.")
+    extra_keys = [
+        st.text_input(
+            f"Clé The-Odds-API n°{i}", type="password", key=f"extra_key_{i}",
+            help="Clé gratuite sur the-odds-api.com (500 appels/mois)."
+        ) for i in (1, 2, 3)
+    ]
+    api_keys = tuple(dict.fromkeys(
+        [*secret_keys, *[k.strip() for k in extra_keys if len(k.strip()) > 10]]
+    ))
     if st.button("🔄 Rafraîchir les cotes en direct"):
         st.cache_data.clear()
 
     st.markdown("---")
     st.header("⚙️ Paramètres du Modèle")
-    scope = st.radio(
-        "Portée des pronostics",
-        ["Tous les championnats", "Championnat sélectionné"],
-        help="« Tous » analyse les 5 championnats d'un coup (5 requêtes API, mises en cache 5 minutes)."
+    competitions = st.multiselect(
+        "Compétitions à analyser",
+        ALL_COMPETITIONS,
+        default=ALL_COMPETITIONS,
+        help="Chaque compétition coûte 1 requête API, mise en cache 5 minutes."
     )
-    selected_league = st.selectbox("Championnat (simulateur, historique et mode sélectionné)", list(LEAGUES.keys()))
+    selected_league = st.selectbox("Championnat (simulateur et historique)", list(LEAGUES.keys()))
     selected_depth = st.selectbox("Profondeur de l'historique", list(SEASONS.keys()))
     form_weight_pct = st.slider("Poids des 5 derniers matchs (%)", 0, 80, 35, 5)
     k_factor = st.slider("Réactivité Elo (Facteur K)", 10, 40, 20, 2)
@@ -439,29 +619,28 @@ with st.sidebar:
     bankroll = st.number_input("Capital total (Bankroll en €)", min_value=10.0, value=500.0, step=50.0)
     combo_size = st.radio("Taille du Ticket Combiné Auto", [2, 3], index=0, horizontal=True)
 
-leagues_to_scan = list(LEAGUES.keys()) if scope == "Tous les championnats" else [selected_league]
-if selected_league not in leagues_to_scan:
-    leagues_to_scan.append(selected_league)
+sel = build_league_bundle(selected_league, selected_depth, form_weight_pct, k_factor, api_keys)
 
-bundles = {}
-with st.spinner("Analyse des championnats en cours..."):
-    for name in leagues_to_scan:
-        bundle = build_league_bundle(name, selected_depth, form_weight_pct, k_factor, odds_api_key)
-        if bundle is not None:
-            bundles[name] = bundle
-
-if selected_league not in bundles:
+if sel is None:
     st.error("Impossible de charger les données historiques. Vérifiez votre connexion internet.")
 else:
-    sel = bundles[selected_league]
+    scan_results = {}
+    with st.spinner("Analyse des compétitions en cours..."):
+        for name in competitions:
+            if name in LEAGUES:
+                bundle = build_league_bundle(name, selected_depth, form_weight_pct, k_factor, api_keys)
+            else:
+                bundle = build_cup_bundle(name, selected_depth, form_weight_pct, k_factor, api_keys)
+            if bundle is not None:
+                scan_results[name] = bundle
+
     df_history, elo_ratings, stats = sel["df_history"], sel["elo"], sel["stats"]
     avg_h, avg_a, valid_teams = sel["avg_h"], sel["avg_a"], sel["valid_teams"]
 
-    scanned = [n for n in leagues_to_scan if n in bundles and (scope == "Tous les championnats" or n == selected_league)]
-    frames = [bundles[n]["df_preds"] for n in scanned if not bundles[n]["df_preds"].empty]
+    frames = [b["df_preds"] for b in scan_results.values() if not b["df_preds"].empty]
     df_preds = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-    statuses = [(n, bundles[n]["api_status"]) for n in scanned if bundles[n]["api_status"]]
+    statuses = [(n, b["api_status"]) for n, b in scan_results.items() if b["api_status"]]
     if statuses:
         st.info(statuses[-1][1])
         for n, msg in statuses:
@@ -475,16 +654,23 @@ else:
         "📜 Base Historique & Classement Elo"
     ])
 
-    # --- ONGLET 1 : SCANNER TEMPS RÉEL (TOUS LES CHAMPIONNATS) ---
+    # --- ONGLET 1 : SCANNER TEMPS RÉEL (CHAMPIONNATS + COUPES) ---
     with tab_scanner:
-        title_scope = "Tous les championnats" if scope == "Tous les championnats" else selected_league
-        st.subheader(f"📅 Prochains Matchs & Cotes en Direct — {title_scope}")
+        st.subheader(f"📅 Prochains Matchs & Cotes en Direct — {len(competitions)} compétition(s)")
         if df_preds.empty:
-            st.warning("Aucun futur match trouvé.")
+            st.warning("Aucun futur match trouvé pour les compétitions choisies.")
         else:
-            sources = sorted({bundles[n]["source"] for n in scanned})
-            st.caption(f"Source active : **{' / '.join(sources)}** ({len(df_preds)} matchs analysés sur {len(frames)} championnat(s))")
-            shown_leagues = st.multiselect("Championnats affichés", list(df_preds["Championnat"].unique()), default=list(df_preds["Championnat"].unique()))
+            sources = sorted({b["source"] for b in scan_results.values() if not b["df_preds"].empty})
+            st.caption(f"Source active : **{' / '.join(sources)}** ({len(df_preds)} matchs analysés sur {len(frames)} compétition(s))")
+            cups_in_view = [n for n in scan_results if n in CUPS and not scan_results[n]["df_preds"].empty]
+            if cups_in_view:
+                skipped_total = sum(scan_results[n]["skipped"] for n in cups_in_view)
+                st.caption(
+                    "Coupes d'Europe : seuls les clubs des 5 grands championnats sont analysés "
+                    f"({skipped_total} match(s) ignoré(s)). Le niveau relatif des championnats est estimé "
+                    "(Premier League +60, Liga +40, Bundesliga +20, Serie A +15, Ligue 1 +0 points Elo)."
+                )
+            shown_leagues = st.multiselect("Compétitions affichées", list(df_preds["Championnat"].unique()), default=list(df_preds["Championnat"].unique()))
             view = df_preds[df_preds["Championnat"].isin(shown_leagues)]
             only_value = st.checkbox("Afficher seulement les Value Bets")
             if only_value:
