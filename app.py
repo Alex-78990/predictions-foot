@@ -580,6 +580,90 @@ def build_cup_bundle(cup_name, season_key, form_weight_pct, k_factor, api_keys):
     return {"df_preds": df_preds, "api_status": status, "source": source, "skipped": skipped}
 
 
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+
+
+def odds_api_get(path, params, api_keys):
+    """GET sur The Odds API en essayant les clés dans l'ordre (401 ou 429 : clé suivante)."""
+    status = None
+    for pos, key in enumerate(api_keys):
+        try:
+            res = requests.get(f"{ODDS_API_BASE}{path}", params={**params, "apiKey": key.strip()}, timeout=12)
+        except Exception as e:
+            status = f"🟠 Erreur réseau API ({str(e)[:40]})"
+            continue
+        if res.status_code == 200:
+            remaining = res.headers.get("x-requests-remaining", "?")
+            return res.json(), f"🟢 Clé n°{pos + 1} | requêtes restantes : {remaining}"
+        if res.status_code in (401, 429):
+            status = f"🔴 Clé n°{pos + 1} invalide ou quota atteint (erreur {res.status_code})"
+            continue
+        status = f"🟠 Erreur API {res.status_code}"
+        break
+    return None, status or "🟠 Aucune clé API disponible."
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def list_active_sports(api_keys):
+    """Liste des compétitions actives (cet appel ne consomme pas de quota)."""
+    data, status = odds_api_get("/sports/", {}, api_keys)
+    if not data:
+        return [], status
+    sports = [s for s in data if s.get("active") and not s.get("has_outrights")]
+    return sorted(sports, key=lambda s: (s["group"], s["title"])), status
+
+
+def consensus_rows(events, sport_label):
+    """Probabilités de consensus (marge retirée) et meilleures cotes pour chaque match."""
+    rows = []
+    for ev in events:
+        home, away = ev.get("home_team", ""), ev.get("away_team", "")
+        probs, best, n_books = {}, {}, 0
+        for bm in ev.get("bookmakers", []):
+            for market in bm.get("markets", []):
+                if market.get("key") != "h2h":
+                    continue
+                prices = {o["name"]: float(o["price"]) for o in market.get("outcomes", []) if float(o["price"]) > 1}
+                if len(prices) < 2:
+                    continue
+                inverse = {n: 1.0 / p for n, p in prices.items()}
+                total = sum(inverse.values())
+                n_books += 1
+                for n, p in prices.items():
+                    probs.setdefault(n, []).append(inverse[n] / total)
+                    best[n] = max(best.get(n, 0.0), p)
+        if n_books == 0:
+            continue
+        consensus = {n: float(np.mean(v)) for n, v in probs.items()}
+        favourite = max(consensus, key=consensus.get)
+        value_pick = max(consensus, key=lambda n: consensus[n] * best[n])
+        value_pct = (consensus[value_pick] * best[value_pick] - 1) * 100
+        is_value = value_pct > 2.0 and n_books >= 3
+        rows.append({
+            "Sport": sport_label,
+            "_kickoff": ev.get("commence_time", ""),
+            "Match": f"{home} vs {away}",
+            "Favori": favourite,
+            "Proba favori (%)": round(consensus[favourite] * 100, 1),
+            "Meilleure cote favori": round(best[favourite], 2),
+            "Meilleure value": f"{value_pick} @{best[value_pick]:.2f}",
+            "Écart vs consensus (%)": round(value_pct, 1),
+            "Bookmakers": n_books,
+            "Value": "✅ VALUE" if is_value else "Pas de value"
+        })
+    return rows
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_sport_odds(sport_key, sport_label, api_keys):
+    data, status = odds_api_get(
+        f"/sports/{sport_key}/odds/",
+        {"regions": "eu", "markets": "h2h", "oddsFormat": "decimal"},
+        api_keys
+    )
+    return (consensus_rows(data, sport_label) if data else []), status
+
+
 st.title("⚽ Logiciel de Prédiction Pro v4 : Championnats + Coupes d'Europe + Combinés + Bankroll")
 
 secret_keys = read_api_keys_from_secrets()
@@ -647,12 +731,13 @@ else:
             if msg.startswith("🔴") or msg.startswith("🟠"):
                 st.warning(f"{n} : {msg}")
 
-    tab_next, tab_scanner, tab_combo, tab_sim, tab_hist = st.tabs([
+    tab_next, tab_scanner, tab_combo, tab_sim, tab_hist, tab_sports = st.tabs([
         "⏱️ Prochaines 24h",
         "⚡ Scanner Matchs & Cotes en Direct",
         "🎟️ Générateur de Combinés (Duo/Trio) & Spécial '2'",
         "🔍 Simulateur Match par Match",
-        "📜 Base Historique & Classement Elo"
+        "📜 Base Historique & Classement Elo",
+        "🌍 Autres sports (cotes)"
     ])
 
     # --- ONGLET 0 : PROCHAINS MATCHS (TOUTES COMPÉTITIONS, FENÊTRE EN HEURES) ---
@@ -800,3 +885,64 @@ else:
         with col_hist:
             st.subheader(f"📜 Historique Complet ({len(df_history)} matchs)")
             st.dataframe(df_history[['Date', 'Season', 'HomeTeam', 'FTHG', 'FTAG', 'AwayTeam', 'FTR']].iloc[::-1], use_container_width=True)
+
+
+    # --- ONGLET 5 : AUTRES SPORTS (COTES COMPARÉES ENTRE BOOKMAKERS) ---
+    with tab_sports:
+        st.subheader("🌍 Autres sports : cotes comparées entre bookmakers")
+        st.caption(
+            "Pour ces sports, il n'y a pas d'historique de résultats : les probabilités sont le consensus des bookmakers "
+            "(marge retirée). « Value » signale une meilleure cote supérieure de plus de 2 % à la cote juste du consensus, "
+            "avec au moins 3 bookmakers. Chaque compétition analysée coûte 1 requête API."
+        )
+        all_sports, sports_status = list_active_sports(api_keys)
+        if not all_sports:
+            st.warning(sports_status)
+        else:
+            groups = sorted({s["group"] for s in all_sports})
+            chosen_groups = st.multiselect("Sports", groups, default=[])
+            options = {f"{s['group']} · {s['title']}": s for s in all_sports if s["group"] in chosen_groups}
+            chosen_names = st.multiselect("Compétitions", list(options.keys()), default=list(options.keys())[:8])
+            if len(chosen_names) > 15:
+                st.warning("Maximum 15 compétitions à la fois pour protéger votre quota : les 15 premières sont analysées.")
+                chosen_names = chosen_names[:15]
+            horizon_h = st.slider("Matchs dans les prochaines (heures)", 12, 336, 72, 12, key="sports_horizon")
+            st.caption(f"{len(all_sports)} compétitions actives disponibles. Sélection : {len(chosen_names)} (= {len(chosen_names)} requête(s)).")
+            if st.button("Analyser les compétitions choisies", disabled=not chosen_names):
+                collected, last_status = [], None
+                with st.spinner("Récupération des cotes..."):
+                    for label in chosen_names:
+                        sport = options[label]
+                        rows, last_status = fetch_sport_odds(sport["key"], label, api_keys)
+                        collected.extend(rows)
+                st.session_state["sports_rows"] = collected
+                st.session_state["sports_status"] = last_status
+            if "sports_rows" in st.session_state:
+                if st.session_state.get("sports_status"):
+                    st.info(st.session_state["sports_status"])
+                sports_df = pd.DataFrame(st.session_state["sports_rows"])
+                if sports_df.empty:
+                    st.info("Aucun match avec cotes pour cette sélection.")
+                else:
+                    kick = pd.to_datetime(sports_df["_kickoff"], errors="coerce", utc=True)
+                    now_utc = pd.Timestamp.now(tz="UTC")
+                    in_window = (kick >= now_utc - pd.Timedelta(hours=2)) & (kick <= now_utc + pd.Timedelta(hours=horizon_h))
+                    view_df = sports_df[in_window].copy()
+                    view_df["_k"] = kick[in_window]
+                    view_df = view_df.sort_values("_k")
+                    view_df["Coup d'envoi (Paris)"] = view_df["_k"].dt.tz_convert("Europe/Paris").dt.strftime("%a %d/%m %H:%M")
+                    only_value_sports = st.checkbox("Afficher seulement les Value", key="sports_only_value")
+                    if only_value_sports:
+                        view_df = view_df[view_df["Value"] == "✅ VALUE"]
+                    st.caption(f"{len(view_df)} match(s) dans la fenêtre choisie.")
+                    if view_df.empty:
+                        st.info("Aucun match dans cette fenêtre. Élargissez le nombre d'heures.")
+                    else:
+                        st.dataframe(
+                            view_df[[
+                                "Coup d'envoi (Paris)", "Sport", "Match", "Favori", "Proba favori (%)",
+                                "Meilleure cote favori", "Meilleure value", "Écart vs consensus (%)", "Bookmakers", "Value"
+                            ]],
+                            use_container_width=True,
+                            hide_index=True
+                        )
