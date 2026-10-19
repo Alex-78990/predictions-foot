@@ -330,6 +330,85 @@ def predict_match_pro(home_team, away_team, stats, elo_dict, avg_h, avg_a, max_g
     }
 
 # --- 6. INTERFACE UTILISATEUR ---
+def build_predictions(df_upcoming, stats, elo_ratings, avg_h, avg_a):
+    predictions_list = []
+    if df_upcoming.empty:
+        return predictions_list
+    for _, row in df_upcoming.iterrows():
+        h, a = row['HomeTeam'], row['AwayTeam']
+        pred = predict_match_pro(h, a, stats, elo_ratings, avg_h, avg_a)
+
+        probs_map = {
+            "1 (Domicile)": (pred['prob_home'], row['Odd_1']),
+            "N (Nul)": (pred['prob_draw'], row['Odd_N']),
+            "2 (Extérieur)": (pred['prob_away'], row['Odd_2'])
+        }
+        best_pick = max(probs_map.keys(), key=lambda k: probs_map[k][0])
+        best_prob, best_odd = probs_map[best_pick]
+        fair_odd = round(100.0 / best_prob, 2)
+        effective_odd = best_odd if pd.notna(best_odd) else fair_odd
+
+        # Détection de Value Bet sur les 3 issues
+        value_str = "Cotes en attente"
+        if pd.notna(row['Odd_1']) and pd.notna(row['Odd_N']) and pd.notna(row['Odd_2']):
+            evs = [
+                ((pred['prob_home']/100.0 * row['Odd_1']) - 1, f"1 @{row['Odd_1']}"),
+                ((pred['prob_draw']/100.0 * row['Odd_N']) - 1, f"N @{row['Odd_N']}"),
+                ((pred['prob_away']/100.0 * row['Odd_2']) - 1, f"2 @{row['Odd_2']}")
+            ]
+            best_ev_item = max(evs, key=lambda x: x[0])
+            max_ev = best_ev_item[0]
+            if max_ev > 0.02:
+                value_str = f"✅ VALUE {best_ev_item[1]} (+{max_ev*100:.1f}%)"
+            else:
+                value_str = "Pas de Value"
+
+        predictions_list.append({
+            "Date": f"{row['Date']} {row['Heure']}".strip(),
+            "Domicile": h,
+            "Extérieur": a,
+            "1 (%)": round(pred['prob_home'], 1),
+            "N (%)": round(pred['prob_draw'], 1),
+            "2 (%)": round(pred['prob_away'], 1),
+            "Cote 1": row['Odd_1'],
+            "Cote N": row['Odd_N'],
+            "Cote 2": row['Odd_2'],
+            "+2.5 Buts (%)": round(pred['prob_over_25'], 1),
+            "Score Exact": pred['best_score'],
+            "Pronostic Conseillé": f"{best_pick} ({best_prob:.1f}%)",
+            "Value Bet Live": value_str,
+            "_best_pick": best_pick,
+            "_best_prob": best_prob,
+            "_effective_odd": effective_odd,
+            "_prob_2": pred['prob_away']
+        })
+    return predictions_list
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def build_league_bundle(league_name, season_key, form_weight_pct, k_factor, odds_api_key):
+    """Charge l'historique, calcule le modèle et les pronostics d'un championnat."""
+    info = LEAGUES[league_name]
+    df_history = load_historical_data(info["code"], SEASONS[season_key])
+    if df_history.empty:
+        return None
+    elo_ratings = calculate_elo_ratings(df_history, k_factor=k_factor)
+    stats, avg_h, avg_a = calculate_weighted_strengths(df_history, form_weight=form_weight_pct/100.0, n_recent=5)
+    valid_teams = sorted(df_history['HomeTeam'].unique())
+    df_upcoming, api_status = fetch_upcoming_matches(
+        info["code"], info["odds_api"], odds_api_key, valid_teams, df_history
+    )
+    df_preds = pd.DataFrame(build_predictions(df_upcoming, stats, elo_ratings, avg_h, avg_a))
+    if not df_preds.empty:
+        df_preds.insert(0, "Championnat", league_name)
+    source = df_upcoming['Source'].iloc[0] if not df_upcoming.empty else "Aucune source"
+    return {
+        "df_history": df_history, "elo": elo_ratings, "stats": stats,
+        "avg_h": avg_h, "avg_a": avg_a, "valid_teams": valid_teams,
+        "df_preds": df_preds, "api_status": api_status, "source": source
+    }
+
+
 st.title("⚽ Logiciel de Prédiction Pro v4 : Live Odds API + Combinés + Bankroll")
 
 with st.sidebar:
@@ -345,32 +424,49 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("⚙️ Paramètres du Modèle")
-    selected_league = st.selectbox("Championnat", list(LEAGUES.keys()))
+    scope = st.radio(
+        "Portée des pronostics",
+        ["Tous les championnats", "Championnat sélectionné"],
+        help="« Tous » analyse les 5 championnats d'un coup (5 requêtes API, mises en cache 5 minutes)."
+    )
+    selected_league = st.selectbox("Championnat (simulateur, historique et mode sélectionné)", list(LEAGUES.keys()))
     selected_depth = st.selectbox("Profondeur de l'historique", list(SEASONS.keys()))
     form_weight_pct = st.slider("Poids des 5 derniers matchs (%)", 0, 80, 35, 5)
     k_factor = st.slider("Réactivité Elo (Facteur K)", 10, 40, 20, 2)
-    
+
     st.markdown("---")
     st.header("💰 Gestion de Bankroll")
     bankroll = st.number_input("Capital total (Bankroll en €)", min_value=10.0, value=500.0, step=50.0)
     combo_size = st.radio("Taille du Ticket Combiné Auto", [2, 3], index=0, horizontal=True)
 
-league_info = LEAGUES[selected_league]
-df_history = load_historical_data(league_info["code"], SEASONS[selected_depth])
+leagues_to_scan = list(LEAGUES.keys()) if scope == "Tous les championnats" else [selected_league]
+if selected_league not in leagues_to_scan:
+    leagues_to_scan.append(selected_league)
 
-if df_history.empty:
+bundles = {}
+with st.spinner("Analyse des championnats en cours..."):
+    for name in leagues_to_scan:
+        bundle = build_league_bundle(name, selected_depth, form_weight_pct, k_factor, odds_api_key)
+        if bundle is not None:
+            bundles[name] = bundle
+
+if selected_league not in bundles:
     st.error("Impossible de charger les données historiques. Vérifiez votre connexion internet.")
 else:
-    elo_ratings = calculate_elo_ratings(df_history, k_factor=k_factor)
-    stats, avg_h, avg_a = calculate_weighted_strengths(df_history, form_weight=form_weight_pct/100.0, n_recent=5)
-    valid_teams = sorted(df_history['HomeTeam'].unique())
+    sel = bundles[selected_league]
+    df_history, elo_ratings, stats = sel["df_history"], sel["elo"], sel["stats"]
+    avg_h, avg_a, valid_teams = sel["avg_h"], sel["avg_a"], sel["valid_teams"]
 
-    df_upcoming, api_status = fetch_upcoming_matches(
-        league_info["code"], league_info["odds_api"], odds_api_key, valid_teams, df_history
-    )
+    scanned = [n for n in leagues_to_scan if n in bundles and (scope == "Tous les championnats" or n == selected_league)]
+    frames = [bundles[n]["df_preds"] for n in scanned if not bundles[n]["df_preds"].empty]
+    df_preds = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-    if api_status:
-        st.info(api_status)
+    statuses = [(n, bundles[n]["api_status"]) for n in scanned if bundles[n]["api_status"]]
+    if statuses:
+        st.info(statuses[-1][1])
+        for n, msg in statuses:
+            if msg.startswith("🔴") or msg.startswith("🟠"):
+                st.warning(f"{n} : {msg}")
 
     tab_scanner, tab_combo, tab_sim, tab_hist = st.tabs([
         "⚡ Scanner Matchs & Cotes en Direct",
@@ -379,80 +475,35 @@ else:
         "📜 Base Historique & Classement Elo"
     ])
 
-    # Pré-calcul de tous les futurs matchs
-    predictions_list = []
-    if not df_upcoming.empty:
-        for _, row in df_upcoming.iterrows():
-            h, a = row['HomeTeam'], row['AwayTeam']
-            pred = predict_match_pro(h, a, stats, elo_ratings, avg_h, avg_a)
-
-            probs_map = {
-                "1 (Domicile)": (pred['prob_home'], row['Odd_1']),
-                "N (Nul)": (pred['prob_draw'], row['Odd_N']),
-                "2 (Extérieur)": (pred['prob_away'], row['Odd_2'])
-            }
-            best_pick = max(probs_map.keys(), key=lambda k: probs_map[k][0])
-            best_prob, best_odd = probs_map[best_pick]
-            fair_odd = round(100.0 / best_prob, 2)
-            effective_odd = best_odd if pd.notna(best_odd) else fair_odd
-
-            # Détection de Value Bet sur les 3 issues
-            value_str = "Cotes en attente"
-            max_ev = -1.0
-            if pd.notna(row['Odd_1']) and pd.notna(row['Odd_N']) and pd.notna(row['Odd_2']):
-                evs = [
-                    ((pred['prob_home']/100.0 * row['Odd_1']) - 1, f"1 @{row['Odd_1']}"),
-                    ((pred['prob_draw']/100.0 * row['Odd_N']) - 1, f"N @{row['Odd_N']}"),
-                    ((pred['prob_away']/100.0 * row['Odd_2']) - 1, f"2 @{row['Odd_2']}")
-                ]
-                best_ev_item = max(evs, key=lambda x: x[0])
-                max_ev = best_ev_item[0]
-                if max_ev > 0.02:
-                    value_str = f"✅ VALUE {best_ev_item[1]} (+{max_ev*100:.1f}%)"
-                else:
-                    value_str = "Pas de Value"
-
-            predictions_list.append({
-                "Date": f"{row['Date']} {row['Heure']}".strip(),
-                "Domicile": h,
-                "Extérieur": a,
-                "1 (%)": round(pred['prob_home'], 1),
-                "N (%)": round(pred['prob_draw'], 1),
-                "2 (%)": round(pred['prob_away'], 1),
-                "Cote 1": row['Odd_1'],
-                "Cote N": row['Odd_N'],
-                "Cote 2": row['Odd_2'],
-                "+2.5 Buts (%)": round(pred['prob_over_25'], 1),
-                "Score Exact": pred['best_score'],
-                "Pronostic Conseillé": f"{best_pick} ({best_prob:.1f}%)",
-                "Value Bet Live": value_str,
-                "_best_pick": best_pick,
-                "_best_prob": best_prob,
-                "_effective_odd": effective_odd,
-                "_prob_2": pred['prob_away']
-            })
-
-    df_preds = pd.DataFrame(predictions_list)
-
-    # --- ONGLET 1 : SCANNER TEMPS RÉEL ---
+    # --- ONGLET 1 : SCANNER TEMPS RÉEL (TOUS LES CHAMPIONNATS) ---
     with tab_scanner:
-        st.subheader(f"📅 Prochains Matchs & Cotes en Direct — {selected_league}")
+        title_scope = "Tous les championnats" if scope == "Tous les championnats" else selected_league
+        st.subheader(f"📅 Prochains Matchs & Cotes en Direct — {title_scope}")
         if df_preds.empty:
             st.warning("Aucun futur match trouvé.")
         else:
-            st.caption(f"Source active : **{df_upcoming['Source'].iloc[0]}** ({len(df_preds)} matchs analysés)")
+            sources = sorted({bundles[n]["source"] for n in scanned})
+            st.caption(f"Source active : **{' / '.join(sources)}** ({len(df_preds)} matchs analysés sur {len(frames)} championnat(s))")
+            shown_leagues = st.multiselect("Championnats affichés", list(df_preds["Championnat"].unique()), default=list(df_preds["Championnat"].unique()))
+            view = df_preds[df_preds["Championnat"].isin(shown_leagues)]
+            only_value = st.checkbox("Afficher seulement les Value Bets")
+            if only_value:
+                view = view[view["Value Bet Live"].str.contains("VALUE")]
             display_cols = [
-                "Date", "Domicile", "Extérieur", "1 (%)", "N (%)", "2 (%)",
+                "Championnat", "Date", "Domicile", "Extérieur", "1 (%)", "N (%)", "2 (%)",
                 "Cote 1", "Cote N", "Cote 2", "+2.5 Buts (%)", "Score Exact",
                 "Pronostic Conseillé", "Value Bet Live"
             ]
-            st.dataframe(
-                df_preds.sort_values("_best_prob", ascending=False)[display_cols].style.background_gradient(
-                    subset=["1 (%)", "2 (%)", "+2.5 Buts (%)"], cmap="YlGn"
-                ),
-                use_container_width=True,
-                hide_index=True
-            )
+            if view.empty:
+                st.info("Aucun match ne correspond à ce filtre.")
+            else:
+                st.dataframe(
+                    view.sort_values("_best_prob", ascending=False)[display_cols].style.background_gradient(
+                        subset=["1 (%)", "2 (%)", "+2.5 Buts (%)"], cmap="YlGn"
+                    ),
+                    use_container_width=True,
+                    hide_index=True
+                )
 
     # --- ONGLET 2 : GÉNÉRATEUR DE COMBINÉS (2 OU 3 MATCHS) & FILTRE SPÉCIAL "2" ---
     with tab_combo:
@@ -469,8 +520,8 @@ else:
 
             for idx, r in top_picks.iterrows():
                 st.markdown(
-                    f"- **{r['Domicile']} vs {r['Extérieur']}** ({r['Date']}) 👉 "
-                    f"**{r['Pronostic Conseillé']}** | Cote : **`{r['_effective_odd']:.2f}`**"
+                    f"- [{r['Championnat']}] **{r['Domicile']} vs {r['Extérieur']}** ({r['Date']}) 👉 "
+                    f"**{r['Pronostic Conseillé']}** | Cote : **{r['_effective_odd']:.2f}**"
                 )
 
             k1, k2, k3, k4 = st.columns(4)
@@ -483,20 +534,21 @@ else:
             st.subheader("🚀 Filtre Spécial « Cote 2 » (Meilleures Victoires à l'Extérieur)")
             away_favs = df_preds.sort_values("_prob_2", ascending=False).head(5)
             st.dataframe(
-                away_favs[["Date", "Domicile", "Extérieur", "2 (%)", "Cote 2", "Score Exact", "Value Bet Live"]],
+                away_favs[["Championnat", "Date", "Domicile", "Extérieur", "2 (%)", "Cote 2", "Score Exact", "Value Bet Live"]],
                 use_container_width=True,
                 hide_index=True
             )
 
-    # --- ONGLET 3 : SIMULATEUR DÉTAILLÉ ---
+    # --- ONGLET 3 : SIMULATEUR DÉTAILLÉ (CHAMPIONNAT SÉLECTIONNÉ) ---
     with tab_sim:
+        st.caption(f"Équipes de : {selected_league}")
         col1, col2 = st.columns(2)
         with col1:
             home_team = st.selectbox("🏠 Équipe à Domicile", valid_teams, index=0)
-            st.caption(f"**Elo :** `{elo_ratings[home_team]:.0f}` | **5 derniers :** {stats.loc[home_team, 'streak']}")
+            st.caption(f"Elo : {elo_ratings[home_team]:.0f} | 5 derniers : {stats.loc[home_team, 'streak']}")
         with col2:
             away_team = st.selectbox("✈️ Équipe à l'Extérieur", valid_teams, index=min(1, len(valid_teams)-1))
-            st.caption(f"**Elo :** `{elo_ratings[away_team]:.0f}` | **5 derniers :** {stats.loc[away_team, 'streak']}")
+            st.caption(f"Elo : {elo_ratings[away_team]:.0f} | 5 derniers : {stats.loc[away_team, 'streak']}")
 
         if home_team != away_team:
             pred = predict_match_pro(home_team, away_team, stats, elo_ratings, avg_h, avg_a)
@@ -508,7 +560,7 @@ else:
             st.subheader("🎯 Matrice des Scores Exacts (0 à 5 buts)")
             st.dataframe(score_df.style.format("{:.2f}%").background_gradient(cmap="Greens"))
 
-    # --- ONGLET 4 : HISTORIQUE & ELO ---
+    # --- ONGLET 4 : HISTORIQUE & ELO (CHAMPIONNAT SÉLECTIONNÉ) ---
     with tab_hist:
         col_elo, col_hist = st.columns([1, 2])
         with col_elo:
